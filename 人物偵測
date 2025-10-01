@@ -1,0 +1,138 @@
+import cv2
+import mediapipe as mp
+import time 
+
+# --- 設定 ---
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
+VIDEO_PATH = 'D:\\user\\Downloads\\mediapipe\\.venv\\v2G.mp4' 
+
+# === 調整 MediaPipe 信心門檻值 (解決問題2：偵測不夠穩定) ===
+# 降低這些值會讓模型更「寬鬆」，更容易偵測到，但可能會有更多誤判。
+# 建議從 0.5 降到 0.4 或 0.3 試試看，不要降太低。
+MIN_DETECTION_CONFIDENCE = 0.4 # 偵測到人物的最低信心度
+MIN_TRACKING_CONFIDENCE = 0.3  # 追蹤人物的最低信心度
+
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    min_detection_confidence=MIN_DETECTION_CONFIDENCE,
+    min_tracking_confidence=MIN_TRACKING_CONFIDENCE
+)
+
+# --- 影片處理 ---
+cap = cv2.VideoCapture(VIDEO_PATH)
+
+if not cap.isOpened():
+    print(f"錯誤：無法開啟影片檔案 {VIDEO_PATH}")
+    exit()
+
+paused = False
+prev_time = 0 
+
+WINDOW_NAME = 'MediaPipe Pose Detection'
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL) 
+
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps_original = cap.get(cv2.CAP_PROP_FPS)
+
+print(f"影片寬度: {frame_width}, 高度: {frame_height}, 原始 FPS: {fps_original:.2f}")
+
+while cap.isOpened():
+    
+    current_time = time.time()
+    
+    key = cv2.waitKey(1 if not paused else 100) & 0xFF 
+
+    if key == ord('q'):
+        break
+    
+    if key == 32:
+        paused = not paused 
+        print(f"狀態切換：{'暫停' if paused else '播放'}")
+
+    if not paused:
+        success, image = cap.read()
+    else:
+        cv2.imshow(WINDOW_NAME, image) 
+        continue
+    
+    if not success:
+        print("影片處理完成。")
+        break
+
+    # === 調整視窗大小 (保持不變，或根據您的需求調整) ===
+    NEW_WIDTH = 800
+    NEW_HEIGHT = 600
+    image = cv2.resize(image, (NEW_WIDTH, NEW_HEIGHT))
+    # ===================================
+
+    image.flags.writeable = False
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    results = pose.process(image)
+
+    image.flags.writeable = True
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    
+    # 繪製人體骨架點、連線與邊界框
+    if results.pose_landmarks:
+        
+        # === 核心優化：計算更全面的人物邊界框 (解決問題1：框框不夠大) ===
+        h, w, c = image.shape
+        landmarks = results.pose_landmarks.landmark
+        
+        # === 關鍵修改：使用所有 33 個骨架點來計算邊界 ===
+        # 這樣可以確保涵蓋到手部和腳部的最外側點
+        x_coords = [landmark.x * w for landmark in landmarks] 
+        y_coords = [landmark.y * h for landmark in landmarks]
+        
+        # 計算邊界框的最小/最大範圍
+        min_x, max_x = int(min(x_coords)), int(max(x_coords))
+        min_y, max_y = int(min(y_coords)), int(max(y_coords))
+        
+        # === 關鍵修改：增加邊界框的內邊距，確保完全包覆 ===
+        # 建議增加到 20-30 像素，以彌補骨架點不在身體最外緣的問題
+        padding = 25 # 您可以調整這個數值
+        min_x = max(0, min_x - padding)
+        min_y = max(0, min_y - padding)
+        max_x = min(w - 1, max_x + padding)
+        max_y = min(h - 1, max_y + padding)
+        
+        cv2.rectangle(image, (min_x, min_y), (max_x, max_y), (0, 255, 0), 2) 
+        # ===============================================
+        
+        # 繪製人體骨架連線
+        mp_drawing.draw_landmarks(
+            image,
+            results.pose_landmarks,
+            mp_pose.POSE_CONNECTIONS,
+            mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=2),
+            mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=2)
+        )
+    else:
+        # === (可選) 當沒有偵測到人物時，在畫面上印出提示 ===
+        # 如果您想知道何時沒有偵測到，可以加入這行
+        cv2.putText(image, "No person detected!", (50, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2) # 紅色文字
+        # 由於 image.flags.writeable = False 已經被重置，這裡可以直接繪圖
+
+    # === FPS 計算與繪製 (邏輯不變) ===
+    if current_time != prev_time:
+        fps = 1 / (current_time - prev_time)
+        fps_text = f"FPS: {int(fps)}"
+    else:
+        fps_text = "FPS: Calculating..."
+        
+    cv2.putText(image, fps_text, (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2) # 白色文字
+    
+    prev_time = current_time
+    # ============================
+    
+    cv2.imshow(WINDOW_NAME, image) 
+
+# --- 清理資源 ---
+pose.close()
+cap.release()
+cv2.destroyAllWindows()
