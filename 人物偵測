@@ -5,6 +5,7 @@ import mediapipe as mp
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
 VIDEO_PATH = 'D:\\user\\Downloads\\mediapipe\\.venv\\v4.mp4' 
+OUTPUT_PATH = 'D:\\user\\Downloads\\mediapipe\\output_pose_video.mp4' # <--- 輸出檔案路徑
 
 pose = mp_pose.Pose(
     static_image_mode=False,
@@ -12,37 +13,45 @@ pose = mp_pose.Pose(
     min_tracking_confidence=0.5
 )
 
-# --- 影片處理 ---
+# --- 影片處理 (輸入) ---
 cap = cv2.VideoCapture(VIDEO_PATH)
 
 if not cap.isOpened():
     print(f"錯誤：無法開啟影片檔案 {VIDEO_PATH}")
     exit()
 
-# === 調整視窗大小關鍵程式碼 (1/2) ===
-# 命名視窗並允許使用者調整大小
-WINDOW_NAME = 'MediaPipe Pose Detection'
-cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL) 
-# ===================================
-
+# 獲取原始影片資訊
 frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fps = cap.get(cv2.CAP_PROP_FPS)
 
 print(f"影片寬度: {frame_width}, 高度: {frame_height}, FPS: {fps}")
 
+# --- 影片寫入器 (輸出) ---
+# 1. 定義編碼器 (FOURCC)
+# H.264 (MP4) 推薦使用 'mp4v' 或 'XVID'。在 Windows 上 'mp4v' 通常相容性較高。
+fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+
+# 2. 創建 VideoWriter 對象
+# 參數: (輸出檔名, 編碼器, FPS, 幀大小)
+out = cv2.VideoWriter(OUTPUT_PATH, fourcc, fps, (frame_width, frame_height))
+
+if not out.isOpened():
+    print("錯誤：無法開啟或初始化影片寫入器。請檢查輸出路徑和編碼器。")
+    cap.release()
+    exit()
+# ========================
+
+# === 調整視窗大小關鍵程式碼 (1/2) ===
+WINDOW_NAME = 'MediaPipe Pose Detection'
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL) 
+# ===================================
+
 while cap.isOpened():
     success, image = cap.read()
     if not success:
         print("影片處理完成。")
         break
-
-    # === 調整視窗大小關鍵程式碼 (2/2) ===
-    # 實際縮放圖像幀到指定大小 (您可以根據需求修改 320x240)
-    NEW_WIDTH = 320
-    NEW_HEIGHT = 240
-    # image = cv2.resize(image, (NEW_WIDTH, NEW_HEIGHT))
-    # ===================================
 
     # 1. 顏色轉換：OpenCV 使用 BGR，MediaPipe 使用 RGB
     image.flags.writeable = False
@@ -51,34 +60,30 @@ while cap.isOpened():
     # 2. 處理幀：執行人體骨架偵測
     results = pose.process(image)
 
-    # 3. 繪圖：將圖像標記為可寫入，以便繪製骨架
+    # 3. 繪圖：將圖像標記為可寫入，並轉換回 BGR 格式
     image.flags.writeable = True
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     
     # 繪製人體骨架點和連線
     if results.pose_landmarks:
         
-        # === 新增：計算並繪製人物邊界框 ===
-        h, w, c = image.shape # 獲取圖像的高度、寬度 (這裡的 h, w 是縮放後的值)
+        # === 計算並繪製人物邊界框 ===
+        h, w, c = image.shape
         
-        # 將標準化座標 (0~1) 轉換為實際像素座標
         x_coords = [landmark.x * w for landmark in results.pose_landmarks.landmark]
         y_coords = [landmark.y * h for landmark in results.pose_landmarks.landmark]
         
-        # 計算邊界框的範圍
         min_x, max_x = int(min(x_coords)), int(max(x_coords))
         min_y, max_y = int(min(y_coords)), int(max(y_coords))
         
-        # 增加邊界框的內邊距，讓框更寬鬆一些 (像素值)
         padding = 10 
         min_x = max(0, min_x - padding)
         min_y = max(0, min_y - padding)
         max_x = min(w - 1, max_x + padding)
         max_y = min(h - 1, max_y + padding)
         
-        # 使用 OpenCV 繪製矩形框 (綠色，線條粗細為 2)
         cv2.rectangle(image, (min_x, min_y), (max_x, max_y), (0, 255, 0), 2) 
-        # ===================================
+        # =============================
         
         # 繪製人體骨架連線
         mp_drawing.draw_landmarks(
@@ -88,9 +93,13 @@ while cap.isOpened():
             mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=2),
             mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=2)
         )
+    
+    # --- 關鍵：將處理後的幀寫入輸出影片 ---
+    out.write(image)
+    # ------------------------------------
 
     # 4. 顯示結果
-    cv2.imshow(WINDOW_NAME, image) # 使用命名好的視窗名稱
+    cv2.imshow(WINDOW_NAME, image)
 
     # 按下 'q' 鍵退出視窗
     if cv2.waitKey(5) & 0xFF == ord('q'):
@@ -99,4 +108,7 @@ while cap.isOpened():
 # --- 清理資源 ---
 pose.close()
 cap.release()
+out.release() # <--- 釋放影片寫入器資源
 cv2.destroyAllWindows()
+
+print(f"✅ 影片處理完成，輸出檔案已儲存至: {OUTPUT_PATH}")
