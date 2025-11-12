@@ -1,0 +1,296 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import math
+import time
+import csv
+import os
+import glob
+
+# --- 2D 角度計算函式 ---
+def calculate_angle_2d(a, b, c):
+    a = np.array(a)
+    b = np.array(b)
+    c = np.array(c)
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+    angle = np.abs(radians * 180.0 / np.pi)
+    if angle > 180.0:
+        angle = 360 - angle
+    return angle
+
+# --- 主處理函式：分析單一影片 ---
+def process_video(video_path, output_dir, master_csv_writer):
+    """分析單一影片，將數據寫入已開啟的 master CSV writer，並回傳摘要內容和平均角度"""
+    
+    video_basename = os.path.basename(video_path)
+    video_name, _ = os.path.splitext(video_basename)
+    OUTPUT_VIDEO_PATH = os.path.join(output_dir, f'{video_name}_annotated.mp4')
+
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"  [錯誤] 無法開啟影片: {video_basename}")
+        return None, None
+
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if video_fps == 0:
+        video_fps = 30
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, video_fps, (frame_width, frame_height))
+    if not out.isOpened():
+        print(f"  [錯誤] 無法初始化影片寫入器: {video_basename}")
+        cap.release()
+        return None, None
+
+    # === 初始化 ===
+    frame_counter = 0
+    previous_smoothed_landmarks = {}
+    angle_data_for_stats = []
+    SMOOTHING_ALPHA = 0.2
+
+    ANGLE_CHANGE_THRESHOLD = 360.0
+    last_good_angles = {'left_knee': None, 'right_knee': None, 'left_elbow': None, 'right_elbow': None}
+
+    total_detected_counts = {'left_knee': 0, 'right_knee': 0, 'left_elbow': 0, 'right_elbow': 0}
+    valid_angle_counts = {'left_knee': 0, 'right_knee': 0, 'left_elbow': 0, 'right_elbow': 0}
+
+    # === 處理每一幀 ===
+    while cap.isOpened():
+        success, image = cap.read()
+        if not success:
+            break
+
+        frame_counter += 1
+        image.flags.writeable = False
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = pose.process(image_rgb)
+        image.flags.writeable = True
+        
+        current_angles = { 'left_knee': None, 'right_knee': None, 'left_elbow': None, 'right_elbow': None }
+
+        if results.pose_landmarks:
+            if not previous_smoothed_landmarks:
+                for idx, landmark in enumerate(results.pose_landmarks.landmark):
+                    previous_smoothed_landmarks[idx] = [landmark.x, landmark.y]
+            
+            for idx, landmark in enumerate(results.pose_landmarks.landmark):
+                prev_x, prev_y = previous_smoothed_landmarks[idx]
+                smooth_x = SMOOTHING_ALPHA * landmark.x + (1 - SMOOTHING_ALPHA) * prev_x
+                smooth_y = SMOOTHING_ALPHA * landmark.y + (1 - SMOOTHING_ALPHA) * prev_y
+                landmark.x, landmark.y = smooth_x, smooth_y
+                previous_smoothed_landmarks[idx] = [smooth_x, smooth_y]
+
+            landmarks = results.pose_landmarks.landmark
+            try:
+                angle_defs = {
+                    'left_knee': (mp_pose.PoseLandmark.LEFT_HIP, mp_pose.PoseLandmark.LEFT_KNEE, mp_pose.PoseLandmark.LEFT_ANKLE),
+                    'right_knee': (mp_pose.PoseLandmark.RIGHT_HIP, mp_pose.PoseLandmark.RIGHT_KNEE, mp_pose.PoseLandmark.RIGHT_ANKLE),
+                    'left_elbow': (mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.LEFT_ELBOW, mp_pose.PoseLandmark.LEFT_WRIST),
+                    'right_elbow': (mp_pose.PoseLandmark.RIGHT_SHOULDER, mp_pose.PoseLandmark.RIGHT_ELBOW, mp_pose.PoseLandmark.RIGHT_WRIST),
+                }
+                for name, (p1, p2, p3) in angle_defs.items():
+                    pt1 = [landmarks[p1.value].x, landmarks[p1.value].y]
+                    pt2 = [landmarks[p2.value].x, landmarks[p2.value].y]
+                    pt3 = [landmarks[p3.value].x, landmarks[p3.value].y]
+                    angle = calculate_angle_2d(pt1, pt2, pt3)
+                    current_angles[name] = angle
+            except Exception:
+                pass
+
+            mp.solutions.drawing_utils.draw_landmarks(
+                image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                landmark_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(color=(0, 0, 255), thickness=2, circle_radius=4),
+                connection_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(color=(220, 220, 220), thickness=2, circle_radius=2)
+            )
+        
+        filtered_angles_for_stats = {}
+        csv_output_values = {}
+
+        for name, angle in current_angles.items():
+            if angle is not None:
+                total_detected_counts[name] += 1
+                last_good_angle = last_good_angles.get(name)
+                if last_good_angle is not None and abs(angle - last_good_angle) > ANGLE_CHANGE_THRESHOLD:
+                    filtered_angles_for_stats[name] = None
+                    csv_output_values[name] = 'Filtered'
+                else:
+                    filtered_angles_for_stats[name] = angle
+                    csv_output_values[name] = round(angle)
+                    last_good_angles[name] = angle
+                    valid_angle_counts[name] += 1
+            else:
+                filtered_angles_for_stats[name] = None
+                csv_output_values[name] = 'ND'
+
+        csv_row = [video_name, frame_counter] + [csv_output_values[name] for name in ['left_knee', 'right_knee', 'left_elbow', 'right_elbow']]
+        master_csv_writer.writerow(csv_row)
+        
+        angle_data_for_stats.append([filtered_angles_for_stats[name] for name in ['left_knee', 'right_knee', 'left_elbow', 'right_elbow']])
+
+        out.write(image)
+
+    pose.close()
+    cap.release()
+    out.release()
+
+    summary_content = []
+    video_averages = {}
+    if angle_data_for_stats:
+        stats_array = np.array(angle_data_for_stats, dtype=np.float32)
+        duration_seconds = frame_counter / video_fps
+        
+        joint_map = {"左膝": 0, "右膝": 1, "左手肘": 2, "右手肘": 3}
+        joint_key_map = {"左膝": "left_knee", "右膝": "right_knee", "左手肘": "left_elbow", "右手肘": "right_elbow"}
+
+        summary_content.append(f"--- 影片: {video_basename} ---")
+        summary_content.append(f"總持續時間: {duration_seconds:.2f} 秒")
+        summary_content.append(f"影片總幀數: {total_video_frames} 幀")
+        summary_content.append("-" * 20)
+
+        for joint_name, joint_index in joint_map.items():
+            joint_data = stats_array[:, joint_index]
+            summary_content.append(f"關節: {joint_name}")
+
+            english_key = joint_key_map[joint_name]
+            total_count = total_detected_counts[english_key]
+            valid_count = valid_angle_counts[english_key]
+            
+            summary_content.append(f"  - 影片成功偵測幀數: {total_count} 幀")
+            summary_content.append(f"  - 有效偵測次數: {valid_count} 次")
+
+            if total_video_frames > 0:
+                overall_valid_ratio = (valid_count / total_video_frames) * 100
+                summary_content.append(f"  - 有效偵測率 (佔總幀數): {overall_valid_ratio:.2f}%")
+
+            if total_count > 0:
+                valid_ratio_of_detected = (valid_count / total_count) * 100
+                summary_content.append(f"  - 有效偵測率 (佔偵測幀數): {valid_ratio_of_detected:.2f}%")
+            else:
+                summary_content.append(f"  - 有效偵測率 (佔偵測幀數): 0.00%")
+
+            if not np.all(np.isnan(joint_data)):
+                max_angle = np.nanmax(joint_data)
+                mean_angle = np.nanmean(joint_data)
+                summary_content.append(f"  - 最大角度: {max_angle:.2f} 度")
+                summary_content.append(f"  - 平均角度: {mean_angle:.2f} 度")
+                video_averages[english_key] = mean_angle
+            else:
+                summary_content.append("  - 無有效數據")
+                video_averages[english_key] = None
+    else:
+        summary_content.append(f"--- 影片: {video_basename} ---")
+        summary_content.append("沒有收集到足夠的數據來進行統計分析。")
+    
+    print(f"  [成功] 完成分析: {video_basename}")
+    return summary_content, video_averages
+
+# =============================================================================
+# --- 主執行區塊 ---
+# =============================================================================
+if __name__ == "__main__":
+    INPUT_VIDEO_DIR = "D:\\user\\Downloads\\mediapipe\\test_video"
+    OUTPUT_DIR = "D:\\user\\Downloads\\mediapipe\\output_video"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    MASTER_CSV_PATH = os.path.join(OUTPUT_DIR, "master_angles.csv")
+    MASTER_SUMMARY_PATH = os.path.join(OUTPUT_DIR, "master_summary.txt")
+
+    supported_formats = ["*.mp4", "*.avi", "*.mov", "*.mkv"]
+    video_files_to_process = []
+    for fmt in supported_formats:
+        video_files_to_process.extend(glob.glob(os.path.join(INPUT_VIDEO_DIR, fmt)))
+
+    if not video_files_to_process:
+        print(f"在資料夾 {INPUT_VIDEO_DIR} 中找不到任何支援的影片檔案。ளி")
+    else:
+        total_videos = len(video_files_to_process)
+        print("="*50)
+        print(f"找到 {total_videos} 個影片，準備開始批量處理...")
+        print(f"所有數據將寫入: {MASTER_CSV_PATH}")
+        print(f"所有摘要將寫入: {MASTER_SUMMARY_PATH}")
+        print("="*50)
+
+        keyword_data = {}
+
+        try:
+            with open(MASTER_CSV_PATH, 'w', newline='', encoding='utf-8') as csv_file, \
+                 open(MASTER_SUMMARY_PATH, 'w', encoding='utf-8') as summary_file:
+                
+                master_csv_writer = csv.writer(csv_file)
+                master_csv_writer.writerow(['video_name', 'frame', 'left_knee_angle', 'right_knee_angle', 'left_elbow_angle', 'right_elbow_angle'])
+                
+                for i, video_path in enumerate(video_files_to_process):
+                    print(f"\n[{i+1}/{total_videos}] 開始處理: {os.path.basename(video_path)}")
+                    
+                    summary, video_averages = process_video(video_path, OUTPUT_DIR, master_csv_writer)
+                    
+                    if summary:
+                        for line in summary:
+                            summary_file.write(line + '\n')
+                        summary_file.write("\n" + "="*40 + "\n\n")
+
+                    if video_averages:
+                        video_basename = os.path.basename(video_path)
+                        try:
+                            keyword = video_basename.split('_')[1]
+                        except IndexError:
+                            keyword = 'unknown'
+
+                        if keyword not in keyword_data:
+                            keyword_data[keyword] = {'left_knee': [], 'right_knee': [], 'left_elbow': [], 'right_elbow': []}
+
+                        for joint, avg_angle in video_averages.items():
+                            if avg_angle is not None:
+                                keyword_data[keyword][joint].append(avg_angle)
+
+        except IOError as e:
+            print(f"[致命錯誤] 無法寫入報告檔案. 請檢查權限. 原因: {e}")
+        except Exception as e:
+            print(f"[致命錯誤] 處理過程中發生未預期的錯誤: {e}")
+
+        # --- 計算並寫入關鍵字摘要 ---
+        KEYWORD_SUMMARY_PATH = os.path.join(OUTPUT_DIR, "keyword_summary.csv")
+        final_summary_data = []
+        
+        joint_name_map = {
+            'left_knee': 'Left_Knee',
+            'right_knee': 'Right_Knee',
+            'left_elbow': 'Left_Elbow',
+            'right_elbow': 'Right_Elbow'
+        }
+
+        for keyword, joint_angles in sorted(keyword_data.items()):
+            for joint_key, angle_list in joint_angles.items():
+                if angle_list:
+                    avg_of_avg = np.mean(angle_list)
+                    output_joint_name = joint_name_map.get(joint_key, joint_key)
+                    final_summary_data.append({
+                        'keyword': keyword,
+                        'joint': output_joint_name,
+                        'avg_of_avg_angle': f"{avg_of_avg:.2f}"
+                    })
+        
+        if final_summary_data:
+            try:
+                with open(KEYWORD_SUMMARY_PATH, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['keyword', 'joint', 'avg_of_avg_angle'])
+                    writer.writeheader()
+                    writer.writerows(final_summary_data)
+                print("="*50)
+                print(f"關鍵字摘要報告已成功寫入: {KEYWORD_SUMMARY_PATH}")
+            except IOError as e:
+                print(f"[錯誤] 無法寫入關鍵字摘要報告: {e}")
+
+
+        print("="*50)
+        print("所有影片批量處理完成！")
+        print(f"合併數據報告: {MASTER_CSV_PATH}")
+        print(f"合併摘要報告: {MASTER_SUMMARY_PATH}")
+        print(f"(獨立的標記影片也已儲存於 {OUTPUT_DIR})")
+        print("="*50)
