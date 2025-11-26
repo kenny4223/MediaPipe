@@ -41,7 +41,7 @@ def check_person_object_interaction(landmarks, frame_width, frame_height, object
 
     # 動態計算互動距離的閾值，設定為人物邊界框寬度的 20%，讓判斷更具彈性
     person_width = person_bbox[2] - person_bbox[0]
-    interaction_threshold = person_width * 0.2
+    interaction_threshold = person_width * 0.5
 
     # 遍歷所有被 YOLO 偵測到的物品
     for obj in objects_data:
