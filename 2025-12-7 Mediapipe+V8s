@@ -1,0 +1,222 @@
+import cv2
+import mediapipe as mp
+from ultralytics import YOLO
+import numpy as np
+import math
+import time # 匯入 time 模組
+
+# --- 常數設定 ---
+# 定義要使用的 YOLO 模型檔案，'yolov8s.pt' 是速度與準確度較平衡的版本
+YOLO_MODEL = 'yolov8s.pt'
+# 設定要使用的攝影機 ID，0 通常代表電腦的預設內建攝影機
+WEBCAM_ID = 0
+# 設定 YOLO 物件偵測的最低信心度分數閾值
+YOLO_CONFIDENCE_THRESHOLD = 0.25
+# 設定 MediaPipe 姿勢偵測的最低信心度
+MIN_POSE_CONFIDENCE = 0.5
+
+def check_person_object_interaction(landmarks, frame_width, frame_height, objects_data, person_bbox):
+    """
+    [MediaPipe 核心應用函式]
+    檢查人物的手腕與偵測到的物品之間是否存在互動關係 (例如 "持有")。
+    """
+    # 初始化一個空列表，用於存放偵測到的互動結果
+    interactions = []
+    
+    # 獲取 MediaPipe landmarks
+    mp_pose = mp.solutions.pose
+    
+    left_wrist_landmark = landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value]
+    right_wrist_landmark = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST.value]
+
+    # MediaPipe 的 visibility 代表可見度，可作為信心度的替代
+    left_wrist_score = left_wrist_landmark.visibility
+    right_wrist_score = right_wrist_landmark.visibility
+    
+    # 將歸一化的座標轉換為像素座標
+    left_wrist_x = int(left_wrist_landmark.x * frame_width)
+    left_wrist_y = int(left_wrist_landmark.y * frame_height)
+    right_wrist_x = int(right_wrist_landmark.x * frame_width)
+    right_wrist_y = int(right_wrist_landmark.y * frame_height)
+
+    # 動態計算互動距離的閾值，設定為人物邊界框寬度的 40%，讓判斷更具彈性
+    person_width = person_bbox[2] - person_bbox[0]
+    interaction_threshold = person_width * 0.4
+
+    # 遍歷所有被 YOLO 偵測到的物品
+    for obj in objects_data:
+        obj_class = obj['class_name']
+        x1, y1, x2, y2 = obj['bbox']
+        obj_center_x = (x1 + x2) // 2
+        obj_center_y = (y1 + y2) // 2
+
+        # 檢查左手腕的信心度是否足夠高
+        if left_wrist_score > MIN_POSE_CONFIDENCE:
+            distance = math.sqrt((left_wrist_x - obj_center_x)**2 + (left_wrist_y - obj_center_y)**2)
+            if distance < interaction_threshold:
+                interactions.append(f"Holding: {obj_class}")
+                continue
+
+        # 檢查右手腕的信心度是否足夠高
+        if right_wrist_score > MIN_POSE_CONFIDENCE:
+            distance = math.sqrt((right_wrist_x - obj_center_x)**2 + (right_wrist_y - obj_center_y)**2)
+            if distance < interaction_threshold:
+                interactions.append(f"Holding: {obj_class}")
+
+    return interactions
+
+def draw_interactions(frame, interactions, person_bbox):
+    """
+    在畫面上指定位置顯示偵測到的互動文字。
+    """
+    x1, y1, _, _ = person_bbox
+    for i, text in enumerate(interactions):
+        cv2.putText(frame, text, (x1, y1 - 25 - (i * 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 0), 2)
+
+def main():
+    """
+    程式執行的主函式，整合了 YOLOv8 和 MediaPipe Pose 的所有流程。
+    """
+    print("Loading models...")
+    try:
+        yolo_model = YOLO(YOLO_MODEL)
+        mp_pose = mp.solutions.pose
+        pose = mp_pose.Pose(
+            min_detection_confidence=MIN_POSE_CONFIDENCE,
+            min_tracking_confidence=MIN_POSE_CONFIDENCE
+        )
+        mp_drawing = mp.solutions.drawing_utils
+        print("Models loaded successfully.")
+    except Exception as e:
+        print(f"Error loading models: {e}")
+        return
+
+    cap = cv2.VideoCapture(WEBCAM_ID)
+    if not cap.isOpened():
+        print(f"Error: Cannot open camera with ID {WEBCAM_ID}")
+        return
+
+    print("Starting video capture... Press 'q' to quit.")
+
+    target_classes = ['person', 'cell phone', 'handbag', 'suitcase', 'backpack', 'teddy bear', 'bottle','umbrella']
+
+    # 初始化 FPS 計算相關變數
+    prev_time = 0
+    curr_time = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # 記錄處理開始時間
+        start_time = time.time()
+        
+        frame_height, frame_width, _ = frame.shape
+        display_frame = frame.copy()
+        
+        # [YOLO 步驟]
+        yolo_results = yolo_model.track(frame, persist=True, verbose=False)
+        
+        persons_data = []
+        objects_data = []
+
+        if yolo_results and yolo_results[0].boxes and yolo_results[0].boxes.id is not None:
+            boxes = yolo_results[0].boxes.xyxy.cpu().numpy().astype(int)
+            confidences = yolo_results[0].boxes.conf.cpu().numpy()
+            class_ids = yolo_results[0].boxes.cls.cpu().numpy().astype(int)
+            track_ids = yolo_results[0].boxes.id.cpu().numpy().astype(int)
+
+            for i in range(len(boxes)):
+                class_name = yolo_model.names[class_ids[i]]
+                confidence = confidences[i]
+
+                if class_name in target_classes and confidence > YOLO_CONFIDENCE_THRESHOLD:
+                    x1, y1, x2, y2 = boxes[i]
+                    bbox = [x1, y1, x2, y2]
+
+                    if class_name == 'person':
+                        persons_data.append({'bbox': bbox, 'track_id': track_ids[i]})
+                    else:
+                        objects_data.append({'class_name': class_name, 'bbox': bbox})
+
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f'{class_name}: {confidence:.2f}'
+                    (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                    cv2.rectangle(display_frame, (x1, y1 - 20), (x1 + w, y1), (0, 255, 0), -1)
+                    cv2.putText(display_frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+        # [MediaPipe 步驟] 處理整個畫面以獲得最佳姿勢偵測效果
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image_rgb.flags.writeable = False
+        pose_results = pose.process(image_rgb)
+        image_rgb.flags.writeable = True
+
+        # 將 MediaPipe 偵測到的姿勢與 YOLO 偵測到的人物進行匹配
+        if pose_results.pose_landmarks and persons_data:
+            for person in persons_data:
+                person_bbox = person['bbox']
+                px1, py1, px2, py2 = person_bbox
+                person_center_x = (px1 + px2) / 2
+                
+                # 找到最接近此 YOLO 人物框中心的 MediaPipe 姿勢
+                best_match_landmarks = None
+                min_dist = float('inf')
+
+                # 提取 nose 座標來代表姿勢的位置
+                nose_landmark = pose_results.pose_landmarks.landmark[mp_pose.PoseLandmark.NOSE.value]
+                pose_x = nose_landmark.x * frame_width
+                
+                # 如果姿勢的鼻子在人物框內，就視為匹配
+                if px1 < pose_x < px2:
+                    dist = abs(pose_x - person_center_x)
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_match_landmarks = pose_results.pose_landmarks
+
+                if best_match_landmarks:
+                    # [MediaPipe 視覺化]
+                    mp_drawing.draw_landmarks(
+                        display_frame,
+                        best_match_landmarks,
+                        mp_pose.POSE_CONNECTIONS,
+                        landmark_drawing_spec=mp_drawing.DrawingSpec(color=(255, 0, 0), thickness=2, circle_radius=2),
+                        connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2)
+                    )
+
+                    # [MediaPipe 應用] 檢查互動
+                    interactions = check_person_object_interaction(
+                        best_match_landmarks.landmark, 
+                        frame_width, 
+                        frame_height, 
+                        objects_data, 
+                        person_bbox
+                    )
+                    draw_interactions(display_frame, interactions, person_bbox)
+
+        # --- FPS 計算與顯示 ---
+        curr_time = time.time()
+        # 避免除以零的錯誤
+        if (curr_time - prev_time) > 0:
+            fps = 1 / (curr_time - prev_time)
+        else:
+            fps = 0
+        prev_time = curr_time
+        
+        # 在畫面的右下角顯示 FPS
+        cv2.putText(display_frame, f"FPS: {int(fps)}", (frame_width - 150, frame_height - 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+        
+        cv2.imshow('MediaPipe Pose + YOLOv8 Action Recognition', display_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    print("Cleaning up and closing.")
+    pose.close()
+    cap.release()
+    cv2.destroyAllWindows()
+    print("Program finished.")
+
+if __name__ == "__main__":
+    main()
